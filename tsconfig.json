@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "react",
+    "allowUmdGlobalAccess": true,
+    "skipLibCheck": true,
+    "lib": ["ES2023", "DOM"],
+    "paths": { "$taut": ["../taut/shared/Plugin.ts"] },
+    "types": ["react", "node"]
+  },
+  "include": ["src"]
+}

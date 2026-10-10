@@ -1,0 +1,51 @@
+{
+  "node": "v26.7.0",
+  "fixture": "explicit offline, actual Taut ScopedStorage + in-memory BlobStore/Web Locks fixture; no browser/IPC/disk/network",
+  "results": [
+    {
+      "mode": "representative",
+      "run": 1,
+      "events": 2000,
+      "entries": 1000,
+      "images": 384,
+      "storedBytes": 30803174,
+      "restoreMs": 134.05,
+      "captureMs": 233.05,
+      "eventP95Ms": 0.18,
+      "flushMs": 69.18,
+      "writes": 1,
+      "repaints": 2,
+      "heapDeltaMiB": 51.36
+    },
+    {
+      "mode": "representative",
+      "run": 2,
+      "events": 2000,
+      "entries": 1000,
+      "images": 384,
+      "storedBytes": 30803174,
+      "restoreMs": 112.95,
+      "captureMs": 222.91,
+      "eventP95Ms": 0.157,
+      "flushMs": 63.89,
+      "writes": 1,
+      "repaints": 1,
+      "heapDeltaMiB": 48.36
+    },
+    {
+      "mode": "representative",
+      "run": 3,
+      "events": 2000,
+      "entries": 1000,
+      "images": 384,
+      "storedBytes": 30803174,
+      "restoreMs": 108.28,
+      "captureMs": 229.8,
+      "eventP95Ms": 0.161,
+      "flushMs": 63.73,
+      "writes": 1,
+      "repaints": 1,
+      "heapDeltaMiB": -135.13
+    }
+  ]
+}

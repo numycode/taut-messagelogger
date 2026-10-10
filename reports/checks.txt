@@ -1,0 +1,62 @@
+added 14 packages, and audited 15 packages in 2s
+
+1 package is looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+npm notice run npx
+npm notice run 'prettier' --write src scripts test package.json tsconfig.json README.md PROVENANCE.md
+src/MessageLogger.ts 302ms
+scripts/plugin.ts 6ms (unchanged)
+scripts/userPlugin.ts 4ms (unchanged)
+test/bench.mjs 23ms (unchanged)
+test/fixture.mjs 9ms (unchanged)
+test/plugin.test.mjs 31ms
+test/storage.test.mjs 3ms (unchanged)
+test/taut-storage.mjs 4ms (unchanged)
+package.json 2ms (unchanged)
+tsconfig.json 1ms (unchanged)
+README.md 43ms (unchanged)
+PROVENANCE.md 4ms (unchanged)
+npm notice run build:user-plugin
+npm notice run node scripts/userPlugin.ts src/MessageLogger.ts dist/MessageLogger.js
+[build-user-plugin] dist/MessageLogger.js
+npm notice run typecheck
+npm notice run tsc --noEmit
+npm notice run test
+npm notice run node --test test/*.test.mjs
+✔ captures generic message subtype edit, self, bot, DM and thread events without exclusions (18.043664ms)
+✔ repeat transitions preserve exact chronological edit history across flushes (4.012705ms)
+✔ editing without previous payload uses latest observed text (3.265134ms)
+✔ locked latest-value merge keeps concurrent tab edits and deduplicates replay (6.631526ms)
+✔ delete injects original payload, inline history is strikethrough, dismiss actions persist (7.943938ms)
+✔ workspace storage is isolated and switch disables old capture/injection (6.536926ms)
+✔ count, edit count, edit text and recent payload bounds hold under burst (132.838001ms)
+✔ image sources reject private network, arbitrary hosts, ports, userinfo and preserve concurrency (4.728428ms)
+✔ retention purges cold restore and archived images survive deletion/restart (9.085232ms)
+✔ host allowlist never requests private or arbitrary URLs and fetch omits auth with redirects blocked (24.015172ms)
+✔ corrupt restore cannot crash and unknown oversized message fields remain bounded (7.514627ms)
+✔ cross-tab archived preview synchronization and image persistence batching (5.998159ms)
+✔ UTF-8 message bound and long edit replay deduplication (4.784782ms)
+✔ bots, threaded DM deletes, tombstones and configurable sender exclusions (2.97603ms)
+✔ failed persistence keeps dirty state for subsequent retry without dropping received edits (3.320375ms)
+✔ concurrent same-message branches retain new edits without replaying common baseline (5.387146ms)
+✔ image retained-key cache remains bounded even when another tab evicts old entries (4.144732ms)
+✔ accepting deletion in another tab prevents an in-flight preview from resurrecting archived bytes (6.596502ms)
+✔ oversized identity fields cannot bypass message payload bound (5.647409ms)
+✔ router message category without a type field still captures the original (2.591305ms)
+✔ router edit/delete categories without payload type or subtype are recognized (2.673554ms)
+✔ actual Taut locked stores preserve concurrent plugin updates and broadcast dismissal (19.850975ms)
+ℹ tests 22
+ℹ suites 0
+ℹ pass 22
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 343.237596
+found 0 vulnerabilities
+npm notice run npx
+npm notice run 'prettier' --check src scripts test package.json tsconfig.json README.md PROVENANCE.md
+Checking formatting...
+All matched files use Prettier code style!

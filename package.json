@@ -1,0 +1,25 @@
+{
+  "name": "taut-message-logger",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "scripts": {
+    "build:user-plugin": "node scripts/userPlugin.ts",
+    "build": "node scripts/userPlugin.ts src/MessageLogger.ts dist/MessageLogger.js",
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "bench": "node test/bench.mjs"
+  },
+  "devDependencies": {
+    "@monaco-editor/loader": "^1.7.0",
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.7",
+    "esbuild": "0.27.0",
+    "monaco-editor": "^0.55.1",
+    "prettier": "^3.9.9",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "dompurify": "3.4.16"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "node": "v26.7.0",
+  "fixture": "explicit offline, actual Taut ScopedStorage + in-memory BlobStore/Web Locks fixture; no browser/IPC/disk/network",
+  "results": [
+    {
+      "mode": "max-text",
+      "run": 1,
+      "events": 2000,
+      "entries": 1000,
+      "images": 384,
+      "storedBytes": 201623174,
+      "restoreMs": 342.32,
+      "captureMs": 227.05,
+      "eventP95Ms": 0.162,
+      "flushMs": 664.24,
+      "writes": 1,
+      "repaints": 2,
+      "heapDeltaMiB": 570.79
+    }
+  ]
+}
