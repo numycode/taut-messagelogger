@@ -264,7 +264,7 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
 
   start() {
     this.team = this.workspaceId();
-    if (!/^T[A-Z0-9]+$/.test(this.team)) {
+    if (!/^[TE][A-Z0-9]+$/.test(this.team)) {
       this.log("No unambiguous workspace ID; capture disabled");
       return;
     }
