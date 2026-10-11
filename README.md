@@ -1,5 +1,7 @@
 # Taut MessageLogger (personal plugin)
 
+(this readme and this whole project is ai-generated. it is a port of a plugin from slick to taut. use at your own risk.)
+
 An importable, GPL-3.0-only port of Slick MessageLogger. The runtime is a single self-contained `src/MessageLogger.ts`; no Taut core changes, server or deployment.
 
 ## Vibe-slopped / experimental
