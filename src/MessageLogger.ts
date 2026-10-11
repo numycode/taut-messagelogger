@@ -595,6 +595,7 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
     hideEditsFromU08FP1HKKFZ: opt(
       false,
       "Hide edits from meta anon vote (display only; history stays stored)",
+      { label: "Hide edits from meta anon vote" },
     ),
     ignoreSelf: opt(false, "Skip your edits and deletions"),
     ignoreEditsFrom: opt("", "Comma-separated app, user or bot IDs"),

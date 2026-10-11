@@ -1,6 +1,30 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fixture, start, edit } from "./fixture.mjs";
+import { readFile } from "node:fs/promises";
+import vm from "node:vm";
+
+test("meta anon vote option has a friendly settings heading", async () => {
+  const f = fixture();
+  const base = f.context.globalThis.TautOpt;
+  const options = [];
+  f.context.globalThis.TautOpt = Object.assign((value, comment, settings) => {
+    options.push({ value, comment, settings });
+    return value;
+  }, base);
+  vm.runInNewContext(
+    await readFile(
+      new URL("../dist/MessageLogger.js", import.meta.url),
+      "utf8",
+    ),
+    f.context,
+  );
+  const option = options.find((item) =>
+    item.comment.includes("meta anon vote"),
+  );
+  assert.equal(option.settings?.label, "Hide edits from meta anon vote");
+  assert.equal(option.value, false);
+});
 
 test("hide edits from U08FP1HKKFZ defaults off", async (t) => {
   const f = await start();
