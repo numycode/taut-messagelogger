@@ -35,13 +35,29 @@ Object.defineProperty(globalThis, "navigator", {
     },
   },
 });
+export async function readEntries(blob, team = "TTEST") {
+  const index = JSON.parse(
+    (await blob.read(`workspace:${team}:entry-index:v2`)) ?? "{}",
+  );
+  const parts = await Promise.all(
+    Array.from({ length: 64 }, (_, i) =>
+      blob.read(`workspace:${team}:entries:v2:${i}`),
+    ),
+  );
+  return {
+    ...Object.assign({}, ...parts.map((p) => JSON.parse(p ?? "{}"))),
+    __dismissals: index.dismissals,
+  };
+}
 export function blobFixture(initial = new Map()) {
   let writes = 0;
+  let writtenBytes = 0;
   const values = new Map([...initial].map(([k, v]) => [k, JSON.stringify(v)]));
   return {
     values,
     stats: () => ({
       writes,
+      writtenBytes,
       bytes: [...values.values()].reduce((s, v) => s + Buffer.byteLength(v), 0),
     }),
     async read(k) {
@@ -49,6 +65,7 @@ export function blobFixture(initial = new Map()) {
     },
     async write(k, v) {
       writes++;
+      writtenBytes += Buffer.byteLength(v);
       values.set(k, v);
       return true;
     },

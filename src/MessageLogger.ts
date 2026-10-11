@@ -38,7 +38,47 @@ type LogEntry = {
   message?: SlackMessage;
   edits?: StoredEdit[];
   at: number;
+  generation?: number;
 };
+
+// Dismissal barriers share the entry lock; compaction fences older pending captures.
+const DISMISSALS = "__dismissals";
+type Dismissals = {
+  clock: number;
+  floor: number;
+  hideFloor: number;
+  keys: Record<string, { accept?: number; hide?: number }>;
+};
+function dismissalState(values: any): Dismissals {
+  const value = values?.[DISMISSALS];
+  if (
+    !value ||
+    !Number.isSafeInteger(value.clock) ||
+    !Number.isSafeInteger(value.floor) ||
+    !value.keys ||
+    typeof value.keys !== "object"
+  )
+    return { clock: 0, floor: -1, hideFloor: -1, keys: {} };
+  return {
+    ...value,
+    hideFloor: Number.isSafeInteger(value.hideFloor) ? value.hideFloor : -1,
+  };
+}
+function afterDismissal(
+  entry: LogEntry,
+  key: string,
+  state: Dismissals,
+): LogEntry | undefined {
+  const generation = entry.generation ?? 0;
+  const barrier = state.keys[key];
+  if (generation <= state.floor || generation < (barrier?.accept ?? 0))
+    return undefined;
+  if (generation <= state.hideFloor || generation < (barrier?.hide ?? 0)) {
+    if (!entry.deleted) return undefined;
+    return { ...entry, edits: undefined };
+  }
+  return entry;
+}
 
 type RowProps = {
   msg?: SlackMessage;
@@ -135,6 +175,394 @@ function asInjected(
   return trim(message);
 }
 
+// Fixed buckets limit cached stores without serializing the archive on every change.
+// shortcut: hash collisions can concentrate payloads; revisit partitioning if measured sparse writes miss the budget.
+const ENTRY_BUCKETS = 64;
+function bucketOf(key: string) {
+  let hash = 2166136261;
+  for (let i = 0; i < key.length; i++)
+    hash = Math.imul(hash ^ key.charCodeAt(i), 16777619);
+  return (hash >>> 0) % ENTRY_BUCKETS;
+}
+class EntryStorage {
+  private buckets: any[];
+  private index: any;
+  private listeners = new Set<(bucket?: number) => void>();
+  private cleanups: (() => void)[] = [];
+  private loaded = false;
+  readonly ready: Promise<void>;
+  constructor(
+    private storage: any,
+    private team: string,
+    private days: () => number,
+  ) {
+    this.index = storage.store(`workspace:${team}:entry-index:v2`, {});
+    this.buckets = Array.from({ length: ENTRY_BUCKETS }, (_, i) =>
+      storage.store(`workspace:${team}:entries:v2:${i}`, {}),
+    );
+    this.cleanups = this.buckets.map((store, i) =>
+      store.subscribe(() => {
+        if (this.loaded) for (const listener of this.listeners) listener(i);
+      }),
+    );
+    this.ready = this.lock(async () => {
+      await this.prepare(true);
+      this.loaded = true;
+    });
+  }
+  private async lock<T>(run: () => Promise<T>): Promise<T> {
+    return navigator.locks.request(
+      `taut:MessageLogger:workspace:${this.team}:entries:v2`,
+      run,
+    );
+  }
+  subscribe = (listener: (bucket?: number) => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+  close() {
+    for (const cleanup of this.cleanups) cleanup();
+  }
+  get(bucket?: number): Record<string, any> {
+    const values = Object.assign(
+      {},
+      ...(bucket === undefined ? this.buckets : [this.buckets[bucket]]).map(
+        (s) => s.get(),
+      ),
+    );
+    let state = dismissalState({ [DISMISSALS]: this.index.get().dismissals });
+    for (const store of this.buckets) {
+      const candidate = dismissalState(store.get());
+      if (candidate.clock > state.clock) state = candidate;
+    }
+    if (state.clock) values[DISMISSALS] = state;
+    return values;
+  }
+  async refresh() {
+    await this.ready;
+    await this.index.refresh();
+    await Promise.all(this.buckets.map((s) => s.refresh()));
+    return this.get();
+  }
+  async withCurrent<T>(
+    keys: string[],
+    run: (values: Record<string, any>) => Promise<T>,
+  ) {
+    await this.ready.catch(() => {});
+    return this.lock(async () => {
+      await this.prepare();
+      await Promise.all(
+        [...new Set(keys.map(bucketOf))].map((i) => this.buckets[i].refresh()),
+      );
+      return run(this.get());
+    });
+  }
+  private metadata(values: Record<string, any>) {
+    return Object.fromEntries(
+      Object.entries(values)
+        .filter(
+          ([key, e]) =>
+            key !== DISMISSALS &&
+            e &&
+            typeof e.channel === "string" &&
+            typeof e.ts === "string" &&
+            key === `${e.channel}:${e.ts}` &&
+            Number.isFinite(e.at),
+        )
+        .map(([key, e]) => [key, { at: e.at }]),
+    );
+  }
+  private async prepare(all = false) {
+    const index = await this.index.refresh();
+    if (all || index.schema !== 2 || index.pending)
+      await Promise.all(this.buckets.map((s) => s.refresh()));
+    if (index.schema !== 2) {
+      const key = `workspace:${this.team}:entries`;
+      const legacy = this.storage.store(key, {});
+      const old = await legacy.refresh();
+      // Migration is replayed only before the durable marker; old writers must be closed.
+      const values = { ...old, ...this.get() };
+      if (dismissalState(old).clock > dismissalState(values).clock)
+        values[DISMISSALS] = old[DISMISSALS];
+      for (let i = 0; i < ENTRY_BUCKETS; i++) {
+        const part = Object.fromEntries(
+          Object.entries(values).filter(
+            ([k]) => k !== DISMISSALS && bucketOf(k) === i,
+          ),
+        );
+        if (values[DISMISSALS]) part[DISMISSALS] = values[DISMISSALS];
+        if (Object.keys(part).length) {
+          await this.buckets[i].update(() => part);
+          const saved = await this.buckets[i].refresh();
+          if (JSON.stringify(saved) !== JSON.stringify(part))
+            throw new Error("Entry migration verification failed");
+        }
+      }
+      await this.index.update(() => ({ schema: 2, pending: true }));
+      await this.recover();
+    } else if (index.pending) await this.recover();
+    // Retry cleanup after recovery too; a durable marker may outlive interrupted migration.
+    if (all || index.schema !== 2 || index.pending)
+      await this.storage.delete(`workspace:${this.team}:entries`);
+  }
+  private async recover() {
+    const values = this.get();
+    const state = dismissalState(values);
+    const metadata = this.metadata(values);
+    const removed = new Set(evictable(Object.entries(metadata), this.days()));
+    for (const [key, entry] of Object.entries(values)) {
+      if (key === DISMISSALS) continue;
+      const live = metadata[key] && afterDismissal(entry, key, state);
+      if (!live) removed.add(key);
+      else values[key] = live;
+    }
+    for (let i = 0; i < ENTRY_BUCKETS; i++) {
+      const current = this.buckets[i].get() ?? {};
+      const keys = Object.keys(current).filter((k) => k !== DISMISSALS);
+      if (!keys.some((k) => removed.has(k) || values[k] !== current[k]))
+        continue;
+      await this.buckets[i].update((current: Record<string, any>) => {
+        const next: Record<string, any> = { ...current, [DISMISSALS]: state };
+        for (const key of keys)
+          if (removed.has(key)) delete next[key];
+          else next[key] = values[key];
+        return next;
+      });
+    }
+    for (const key of removed) delete values[key];
+    await this.index.update(() => ({
+      schema: 2,
+      entries: this.metadata(values),
+      dismissals: state,
+    }));
+  }
+  update = async (
+    change: (values: Record<string, any>) => Record<string, any>,
+    keys: string[] = [],
+  ) => {
+    // Initialization failure may be transient; retry conversion before admitting writes.
+    await this.ready.catch(() => {});
+    return this.lock(async () => {
+      await this.prepare();
+      const touched = new Set(keys.map(bucketOf));
+      const loaded = this.loaded;
+      this.loaded = false;
+      try {
+        await Promise.all([...touched].map((i) => this.buckets[i].refresh()));
+        // The small index supplies global retention; untouched cached payloads may be stale.
+        const current = this.get();
+        const next = change(current);
+        const metadata = { ...this.index.get().entries };
+        for (const key of keys)
+          if (next[key]) metadata[key] = { at: next[key].at };
+          else delete metadata[key];
+        const gone = evictable(Object.entries(metadata), this.days());
+        for (const key of gone) {
+          delete next[key];
+          delete metadata[key];
+          touched.add(bucketOf(key));
+        }
+        const state = dismissalState(next);
+        await this.index.update((index: any) => ({ ...index, pending: true }));
+        // Evict before inserting, so even an interrupted multi-key write never exceeds the cap.
+        for (const i of new Set(
+          gone.filter((key) => this.index.get().entries[key]).map(bucketOf),
+        ))
+          await this.buckets[i].update((value: Record<string, any>) => {
+            const next = { ...value };
+            for (const key of gone) if (bucketOf(key) === i) delete next[key];
+            return next;
+          });
+        for (const i of touched) {
+          const changes = new Set(
+            [...keys, ...gone].filter((k) => bucketOf(k) === i),
+          );
+          await this.buckets[i].update((value: Record<string, any>) => {
+            const updated: Record<string, any> = {
+              ...value,
+              [DISMISSALS]: state,
+            };
+            for (const key of changes)
+              if (next[key]) updated[key] = next[key];
+              else delete updated[key];
+            return updated;
+          });
+        }
+        await this.index.update(() => ({
+          schema: 2,
+          entries: metadata,
+          dismissals: state,
+        }));
+        this.loaded = true;
+        for (const i of touched)
+          for (const listener of this.listeners) listener(i);
+        return next;
+      } finally {
+        this.loaded = loaded || this.loaded;
+      }
+    });
+  };
+}
+
+// Image bytes have their own smaller buckets; the index preserves global insertion order.
+const IMAGE_BUCKETS = 16;
+class ImageStorage {
+  private buckets: any[];
+  private index: any;
+  private listeners = new Set<(bucket: number) => void>();
+  private cleanups: (() => void)[];
+  private loaded = false;
+  readonly ready: Promise<void>;
+  constructor(
+    private storage: any,
+    private team: string,
+  ) {
+    this.index = storage.store(`workspace:${team}:image-index:v2`, {});
+    this.buckets = Array.from({ length: IMAGE_BUCKETS }, (_, i) =>
+      storage.store(`workspace:${team}:images:v2:${i}`, {}),
+    );
+    this.cleanups = this.buckets.map((store, i) =>
+      store.subscribe(() => {
+        if (this.loaded) for (const listener of this.listeners) listener(i);
+      }),
+    );
+    this.ready = this.lock(async () => {
+      await this.prepare(true);
+      this.loaded = true;
+    });
+  }
+  private async lock<T>(run: () => Promise<T>): Promise<T> {
+    return navigator.locks.request(
+      `taut:MessageLogger:workspace:${this.team}:images:v2`,
+      run,
+    );
+  }
+  subscribe(listener: (bucket: number) => void) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  close() {
+    for (const cleanup of this.cleanups) cleanup();
+  }
+  get(bucket?: number) {
+    const values = Object.assign(
+      {},
+      ...(bucket === undefined ? this.buckets : [this.buckets[bucket]]).map(
+        (s) => s.get(),
+      ),
+    );
+    return Object.fromEntries(
+      [...new Set([...(this.index.get().keys ?? []), ...Object.keys(values)])]
+        .filter((key) => values[key])
+        .map((key) => [key, values[key]]),
+    );
+  }
+  private async prepare(all = false) {
+    const index = await this.index.refresh();
+    if (all || index.schema !== 2 || index.pending)
+      await Promise.all(this.buckets.map((s) => s.refresh()));
+    if (index.schema !== 2) {
+      const key = `workspace:${this.team}:images`;
+      const legacy = this.storage.store(key, {});
+      const old = await legacy.refresh();
+      const values = { ...old, ...this.get() };
+      for (let i = 0; i < IMAGE_BUCKETS; i++) {
+        const part = Object.fromEntries(
+          Object.entries(values).filter(
+            ([key]) => bucketOf(key) % IMAGE_BUCKETS === i,
+          ),
+        );
+        if (!Object.keys(part).length) continue;
+        await this.buckets[i].update(() => part);
+        if (
+          JSON.stringify(await this.buckets[i].refresh()) !==
+          JSON.stringify(part)
+        )
+          throw new Error("Image migration verification failed");
+      }
+      await this.index.update(() => ({
+        schema: 2,
+        pending: true,
+        keys: Object.keys(values),
+      }));
+      await this.recover();
+    } else if (index.pending) await this.recover();
+    if (all || index.schema !== 2 || index.pending)
+      await this.storage.delete(`workspace:${this.team}:images`);
+  }
+  private async recover() {
+    const values = this.get();
+    const keys = [
+      ...new Set([...(this.index.get().keys ?? []), ...Object.keys(values)]),
+    ].filter((k) => values[k]);
+    const gone = keys.slice(0, -128);
+    for (const i of new Set(gone.map((k) => bucketOf(k) % IMAGE_BUCKETS)))
+      await this.buckets[i].update((value: Record<string, any>) => {
+        const next = { ...value };
+        for (const key of gone) delete next[key];
+        return next;
+      });
+    await this.index.update(() => ({ schema: 2, keys: keys.slice(-128) }));
+  }
+  update = async (
+    change: (values: Record<string, any>) => Record<string, any>,
+    keys: string[],
+  ) => {
+    await this.ready.catch(() => {});
+    return this.lock(async () => {
+      const loaded = this.loaded;
+      this.loaded = false;
+      try {
+        await this.prepare();
+        const touched = new Set(keys.map((k) => bucketOf(k) % IMAGE_BUCKETS));
+        await Promise.all([...touched].map((i) => this.buckets[i].refresh()));
+        const next = change(this.get());
+        const order = new Set<string>(this.index.get().keys);
+        for (const key of keys)
+          if (next[key]) order.add(key);
+          else order.delete(key);
+        const pendingKeys = [...order];
+        const gone = pendingKeys.slice(0, -128);
+        for (const key of gone) {
+          delete next[key];
+          order.delete(key);
+          touched.add(bucketOf(key) % IMAGE_BUCKETS);
+        }
+        await this.index.update((index: any) => ({
+          ...index,
+          pending: true,
+          keys: pendingKeys,
+        }));
+        for (const i of new Set(gone.map((k) => bucketOf(k) % IMAGE_BUCKETS)))
+          await this.buckets[i].update((value: Record<string, any>) => {
+            const next = { ...value };
+            for (const key of gone) delete next[key];
+            return next;
+          });
+        for (const i of touched) {
+          const changes = [...keys, ...gone].filter(
+            (k) => bucketOf(k) % IMAGE_BUCKETS === i,
+          );
+          await this.buckets[i].update((value: Record<string, any>) => {
+            const updated = { ...value };
+            for (const key of changes)
+              if (next[key]) updated[key] = next[key];
+              else delete updated[key];
+            return updated;
+          });
+        }
+        await this.index.update(() => ({ schema: 2, keys: [...order] }));
+        this.loaded = true;
+        for (const i of touched)
+          for (const listener of this.listeners) listener(i);
+        return next;
+      } finally {
+        this.loaded = loaded || this.loaded;
+      }
+    });
+  };
+}
+
 export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
   static readonly id = "MessageLogger";
   static readonly pluginName = "Message Logger";
@@ -163,6 +591,10 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
       ["red", "opacity"],
       "red",
       "Deleted message appearance",
+    ),
+    hideEditsFromU08FP1HKKFZ: opt(
+      false,
+      "Hide edits from meta anon vote (display only; history stays stored)",
     ),
     ignoreSelf: opt(false, "Skip your edits and deletions"),
     ignoreEditsFrom: opt("", "Comma-separated app, user or bot IDs"),
@@ -200,16 +632,26 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
     if (!batch.length) return this.imageWrites;
     this.imageWrites = this.imageWrites
       .then(async () => {
-        await this.imageSaved.update(
-          (current: Record<string, SavedImage[]>) => {
-            const next = { ...current };
-            for (const [key, value] of batch)
-              if (value) next[key] = value;
-              else delete next[key];
-            for (const key of Object.keys(next).slice(0, -128))
-              delete next[key];
-            return next;
-          },
+        // Lock order is entries then images, so acceptance cannot race preview persistence.
+        await this.saved.withCurrent(
+          batch.map(([key]) => key),
+          (entries: Record<string, LogEntry>) =>
+            this.imageSaved.update(
+              (current: Record<string, SavedImage[]>) => {
+                const next = { ...current };
+                const state = dismissalState(entries);
+                for (const [key, value] of batch)
+                  if (
+                    value &&
+                    entries[key] &&
+                    afterDismissal(entries[key], key, state)?.deleted
+                  )
+                    next[key] = value;
+                  else delete next[key];
+                return next;
+              },
+              batch.map(([key]) => key),
+            ),
         );
       })
       .catch((error) => {
@@ -244,7 +686,7 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
   }
   private readonly entries = new Map<string, LogEntry>();
   private readonly recent = new Map<string, SlackMessage>();
-  private readonly dirty = new Set<string>();
+  private readonly dirty = new Map<string, LogEntry | undefined>();
   private writes: Promise<void> = Promise.resolve();
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private rowTimer: ReturnType<typeof setTimeout> | null = null;
@@ -268,11 +710,12 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
       this.log("No unambiguous workspace ID; capture disabled");
       return;
     }
-    this.saved = this.api.storage.store(`workspace:${this.team}:entries`, {});
-    const imageStore = this.api.storage.store(
-      `workspace:${this.team}:images`,
-      {} as Record<string, any>,
+    this.saved = new EntryStorage(
+      this.api.storage,
+      this.team,
+      () => this.config.retentionDays,
     );
+    const imageStore = new ImageStorage(this.api.storage, this.team);
     this.imageSaved = imageStore;
     const imageStorage = {
       entries: async <T>(prefix: string) => {
@@ -303,13 +746,18 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
       () => this.imageController.abort(),
       { once: true },
     );
-    this.unsubscribeImages = imageStore.subscribe(() => {
+    this.unsubscribeImages = imageStore.subscribe((bucket) => {
       if (!this.active() || !this.images) return;
-      this.images.sync(imageStore.get(), this.imagePending);
+      this.images.sync(
+        imageStore.get(bucket),
+        this.imagePending,
+        bucket,
+        Object.keys(imageStore.get()),
+      );
       this.repaint();
     });
-    this.unsubscribe = this.saved.subscribe(() => {
-      if (this.active()) this.sync();
+    this.unsubscribe = this.saved.subscribe((bucket: number) => {
+      if (this.active()) this.sync(bucket);
     });
     this.api.rtm.on("message", (event) => {
       if (this.active() && !isDeleteEvent(event) && !isChangeEvent(event))
@@ -347,12 +795,16 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
         console.error("[Taut] MessageLogger restore failed", e),
       );
   }
-  private sync() {
+  private sync(bucket?: number) {
     const pending = new Map(
-      [...this.dirty].map((k) => [k, this.entries.get(k)]),
+      [...this.dirty.keys()]
+        .filter((k) => bucket === undefined || bucketOf(k) === bucket)
+        .map((k) => [k, this.dirty.get(k)]),
     );
-    this.entries.clear();
-    const values = this.saved.get();
+    for (const key of this.entries.keys())
+      if (bucket === undefined || bucketOf(key) === bucket)
+        this.entries.delete(key);
+    const values = this.saved.get(bucket);
     if (values && typeof values === "object")
       for (const [k, e] of Object.entries(values)) {
         const raw = e as LogEntry;
@@ -375,26 +827,40 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
           k !== this.key(entry.channel, entry.ts)
         )
           continue;
-        if (normalize(entry)) this.dirty.add(k);
+        if (normalize(entry)) this.dirty.set(k, entry);
         this.entries.set(k, entry);
       }
-    for (const [k, e] of pending)
-      if (e) this.entries.set(k, e);
-      else this.entries.delete(k);
+    for (const [k, e] of pending) {
+      const live =
+        e && !this.dismiss.has(k)
+          ? afterDismissal(e, k, dismissalState(values))
+          : e;
+      if (live) this.entries.set(k, live);
+      else if (!e) this.entries.delete(k);
+      else this.dirty.delete(k);
+    }
     this.images?.reconcile(
       new Set(
-        [...this.entries]
-          .filter(([, entry]) => entry.deleted)
+        [
+          ...new Map<string, LogEntry | undefined>([
+            ...Object.entries(this.saved.get() as Record<string, LogEntry>),
+            ...this.dirty,
+          ]),
+        ]
+          .filter(([, entry]) => entry?.deleted)
           .map(([key]) => key),
       ),
     );
+    this.cap();
     this.repaint();
   }
   async stop() {
     this.stopped = true;
     this.imageController.abort();
     this.unsubscribe?.();
+    this.saved?.close();
     this.unsubscribeImages?.();
+    this.imageSaved?.close();
     if (this.rowTimer) clearTimeout(this.rowTimer);
     if (this.repaintTimer) clearTimeout(this.repaintTimer);
     await this.flush();
@@ -426,7 +892,7 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
     else if (isChangeEvent(event)) this.recordEdit(event);
   }
 
-  private captureImages(key: string, message: SlackMessage) {
+  private captureImages(key: string, message: SlackMessage, deletion = false) {
     if (
       !this.active() ||
       !this.config.saveImages ||
@@ -436,14 +902,18 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
       return;
     // Slack normalizes history files to IDs; RTM messages can carry full objects.
     const files = this.api.redux.getRawState()?.files;
-    this.images?.capture(key, {
-      ...message,
-      files: Array.isArray(message.files)
-        ? message.files
-            .map((file) => (typeof file === "string" ? files?.[file] : file))
-            .filter(Boolean)
-        : message.files,
-    });
+    this.images?.capture(
+      key,
+      {
+        ...message,
+        files: Array.isArray(message.files)
+          ? message.files
+              .map((file) => (typeof file === "string" ? files?.[file] : file))
+              .filter(Boolean)
+          : message.files,
+      },
+      deletion,
+    );
   }
 
   private previousOf(event: RtmEvent): SlackMessage | undefined {
@@ -523,7 +993,9 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
     if (this.skipSelf(user)) return;
 
     const key = this.key(channel, ts);
-    const existing = this.entries.get(key);
+    const state = dismissalState(this.saved.get());
+    const inherited = this.entries.get(key);
+    const existing = inherited && afterDismissal(inherited, key, state);
     if (existing?.deleted) return;
 
     const message = original ? asInjected(original, channel, ts) : undefined;
@@ -533,13 +1005,14 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
       ts,
       user: existing?.user || user,
       deleted: true,
+      generation: state.clock,
       message: message ?? existing?.message,
       at: Date.now(),
     };
     this.entries.set(key, entry);
+    if (original) this.captureImages(key, original, true);
     this.images?.retain(key);
-    if (original) this.captureImages(key, original);
-    this.dirty.add(key);
+    this.dirty.set(key, this.entries.get(key));
     this.cap();
     this.persist();
     this.repaint();
@@ -574,7 +1047,9 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
     if (!oldText || oldText === newText) return;
 
     const key = this.key(channel, ts);
-    const existing = this.entries.get(key);
+    const state = dismissalState(this.saved.get());
+    const inherited = this.entries.get(key);
+    const existing = inherited && afterDismissal(inherited, key, state);
     const edits = existing?.edits ? [...existing.edits] : [];
     const last = edits[edits.length - 1];
     if (last && last.oldText === oldText && last.newText === newText) return;
@@ -591,9 +1066,10 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
       ts,
       user: existing?.user || user,
       edits,
+      generation: state.clock,
       at: existing?.at ?? Date.now(),
     });
-    this.dirty.add(key);
+    this.dirty.set(key, this.entries.get(key));
     this.cap();
     this.persist();
     this.repaint();
@@ -602,13 +1078,14 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
   private forget(key: string) {
     this.entries.delete(key);
     this.images?.forget(key);
-    this.dirty.add(key);
+    this.dirty.set(key, this.entries.get(key));
   }
 
   /** Returns whether anything was evicted. */
   private cap(): boolean {
     const gone = evictable(this.entries, this.config.retentionDays);
-    for (const key of gone) this.forget(key);
+    // Local view eviction is not permission to delete newer durable captures.
+    for (const key of gone) this.entries.delete(key);
     return gone.length > 0;
   }
 
@@ -626,53 +1103,80 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
       this.persistTimer = null;
     }
     if (!this.saved || !this.dirty.size) return this.writes;
-    const batch = [...this.dirty].map((k) => ({
+    const batch = [...this.dirty].map(([k, entry]) => ({
       key: k,
-      entry: this.entries.get(k),
+      entry,
       dismiss: this.dismiss.get(k),
     }));
     this.dirty.clear();
     this.dismiss.clear();
-    const now = Date.now();
-    const days = this.config.retentionDays;
     this.writes = this.writes
       .then(async () => {
-        await this.saved.update((current: Record<string, LogEntry>) => {
-          const next = { ...current };
-          for (const { key, entry, dismiss } of batch) {
-            if (dismiss === "accept" || !entry) {
-              delete next[key];
-              continue;
+        await this.saved.update(
+          (current: Record<string, any>) => {
+            const next = { ...current };
+            const previous = dismissalState(current);
+            const state: Dismissals = {
+              ...previous,
+              keys: { ...previous.keys },
+            };
+            for (const { key, entry: captured, dismiss } of batch) {
+              if (dismiss) {
+                state.clock++;
+                state.keys[key] = {
+                  ...state.keys[key],
+                  [dismiss]: state.clock,
+                };
+              }
+              const entry = captured && afterDismissal(captured, key, previous);
+              if (captured && !entry && dismiss !== "accept") continue;
+              if (dismiss === "accept" || !entry) {
+                delete next[key];
+                continue;
+              }
+              if (dismiss === "hide") {
+                const latest = next[key] ? mergeEntry(next[key], entry) : entry;
+                if (latest.deleted) next[key] = { ...latest, edits: undefined };
+                else delete next[key];
+                continue;
+              }
+              const oldEdits = Array.isArray(next[key]?.edits)
+                ? next[key].edits!
+                : [];
+              const merged = next[key]
+                ? mergeEntry({ ...next[key], edits: oldEdits }, entry)
+                : entry;
+              // The same RTM edit may arrive in multiple tabs.
+              if (merged.edits)
+                merged.edits = mergeEdits(oldEdits, entry.edits ?? []);
+              next[key] = merged;
             }
-            if (dismiss === "hide") {
-              if (next[key]?.deleted)
-                next[key] = { ...next[key], edits: undefined };
-              else delete next[key];
-              continue;
+
+            const barriers = Object.entries(state.keys).sort(
+              (a, b) =>
+                Math.max(a[1].accept ?? 0, a[1].hide ?? 0) -
+                Math.max(b[1].accept ?? 0, b[1].hide ?? 0),
+            );
+            for (const [key, barrier] of barriers.slice(0, -MAX_ENTRIES)) {
+              state.floor = Math.max(state.floor, barrier.accept ?? -1);
+              state.hideFloor = Math.max(state.hideFloor, barrier.hide ?? -1);
+              delete state.keys[key];
             }
-            const oldEdits = Array.isArray(next[key]?.edits)
-              ? next[key].edits!
-              : [];
-            const merged = next[key]
-              ? mergeEntry({ ...next[key], edits: oldEdits }, entry)
-              : entry;
-            // The same RTM edit may arrive in multiple tabs.
-            if (merged.edits)
-              merged.edits = mergeEdits(oldEdits, entry.edits ?? []);
-            next[key] = merged;
-          }
-          for (const key of evictable(Object.entries(next), days, now))
-            delete next[key];
-          return next;
-        });
-        if (!this.stopped) this.sync();
+            if (state.clock) next[DISMISSALS] = state;
+            return next;
+          },
+          batch.map((item) => item.key),
+        );
+        if (!this.stopped)
+          for (const bucket of new Set(batch.map((item) => bucketOf(item.key))))
+            this.sync(bucket);
       })
       .catch((error) => {
         console.error("[Taut] MessageLogger persistence failed", error);
         for (const item of batch) {
           if (!this.dirty.has(item.key)) {
             if (item.entry) this.entries.set(item.key, item.entry);
-            this.dirty.add(item.key);
+            this.dirty.set(item.key, item.entry);
             if (item.dismiss) this.dismiss.set(item.key, item.dismiss);
           }
         }
@@ -911,13 +1415,18 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
         this.captureImages(this.key(channel, msg.ts), msg);
     }, [msg, props.channelId, entry?.deleted]);
     this.seenRow = true;
-    if (!entry?.deleted && !entry?.edits?.length)
+    const edits =
+      this.config.hideEditsFromU08FP1HKKFZ &&
+      (msg?.user || entry?.message?.user || entry?.user) === "U08FP1HKKFZ"
+        ? undefined
+        : entry?.edits;
+    if (!entry || (!entry.deleted && !edits?.length))
       return React.createElement(Original, props);
 
     const classes = [
       props.className,
       entry.deleted && "taut-message-logger-deleted",
-      entry.edits?.length && "taut-message-logger-edited",
+      edits?.length && "taut-message-logger-edited",
     ]
       .filter(Boolean)
       .join(" ");
@@ -975,13 +1484,13 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
         React.createElement(Original, rowProps),
       ),
     );
-    if (!entry.edits?.length || !msg?.ts) return row;
+    if (!edits?.length || !msg?.ts) return row;
     return React.createElement(
       this.EditContext.Provider,
       {
         value: {
           ts: msg.ts,
-          edits: entry.edits,
+          edits,
           blocks: Array.isArray(msg.blocks) && msg.blocks.length > 0,
         },
       },
@@ -1083,7 +1592,7 @@ export default class MessageLogger extends TautPlugin<typeof MessageLogger> {
     if (current.deleted)
       this.entries.set(key, { ...current, edits: undefined });
     else this.entries.delete(key);
-    this.dirty.add(key);
+    this.dirty.set(key, this.entries.get(key));
     this.persist();
     this.repaint();
   }
@@ -1269,7 +1778,11 @@ function mergeEntry<T extends Mergeable>(stored: T, live: T): T {
     message: live.message ?? stored.message,
     edits: edits.length ? edits : undefined,
     at:
-      live.deleted && !stored.deleted ? live.at : Math.min(stored.at, live.at),
+      live.deleted && !stored.deleted
+        ? live.at
+        : stored.deleted && !live.deleted
+          ? stored.at
+          : Math.min(stored.at, live.at),
   };
 }
 function safeImageURL(value: string): boolean {
@@ -1461,6 +1974,8 @@ class ImageArchive {
   private retained = new Set<string>();
   private attempted = new Map<string, string>();
   private pending = new Map<string, object>();
+  private queued = new Map<string, () => void>();
+  private running = 0;
   private writes: Promise<unknown> = Promise.resolve();
   private store: Store;
   private signal: AbortSignal;
@@ -1502,71 +2017,102 @@ class ImageArchive {
   sync(
     saved: Record<string, unknown>,
     pending: Map<string, SavedImage[] | null>,
+    bucket?: number,
+    order = Object.keys(saved),
   ) {
     const merged = { ...saved };
     for (const [key, value] of pending)
       if (value) merged[key] = value;
       else delete merged[key];
-    this.archived = new Map(
-      Object.entries(merged)
-        .filter((pair): pair is [string, SavedImage[]] => validImages(pair[1]))
-        .slice(-128),
-    );
+    for (const key of this.archived.keys())
+      if (bucket === undefined || bucketOf(key) % IMAGE_BUCKETS === bucket)
+        this.archived.delete(key);
+    for (const [key, value] of Object.entries(merged))
+      if (
+        (bucket === undefined || bucketOf(key) % IMAGE_BUCKETS === bucket) &&
+        validImages(value)
+      )
+        this.archived.set(key, value);
+    for (const key of this.archived.keys())
+      if (!order.includes(key) && !pending.has(key)) this.archived.delete(key);
+    this.archived = new Map([
+      ...order
+        .filter((key) => this.archived.has(key))
+        .map((key) => [key, this.archived.get(key)!] as const),
+      ...this.archived,
+    ]);
+    while (this.archived.size > MAX_ARCHIVED)
+      this.archived.delete(this.archived.keys().next().value!);
   }
   get(key: string): SavedImage[] {
     return this.archived.get(key) ?? [];
   }
 
-  capture(key: string, message: SlackMessage) {
-    if (this.signal.aborted || this.archived.has(key) || this.pending.has(key))
-      return;
-    // A deletion payload can omit files or refer to already-tombstoned metadata.
-    if (this.retained.has(key) && this.pending.has(key)) return;
+  capture(key: string, message: SlackMessage, deletion = false) {
+    if (this.signal.aborted || this.archived.has(key)) return;
     const sources = imageSources(message);
+    // Missing deletion metadata is not evidence that the last observed image changed.
+    if (deletion && !sources.length) return;
     const signature = JSON.stringify(sources);
     if (this.attempted.get(key) === signature) return;
-    if (this.pending.size >= 8 && !this.pending.has(key)) return;
     this.pending.delete(key);
+    this.queued.delete(key);
+    // Source invalidation must not depend on download capacity.
+    this.recent.delete(key);
+    if (sources.length && this.running >= 8 && this.queued.size >= 8) {
+      this.attempted.delete(key);
+      return;
+    }
     this.attempted.set(key, signature);
     while (this.attempted.size > 400)
       this.attempted.delete(this.attempted.keys().next().value!);
-    // Drop a cached preview when an edit replaces its image.
-    this.recent.delete(key);
     if (!sources.length) return;
     const token = {};
     this.pending.set(key, token);
-    void (async () => {
-      const images: SavedImage[] = [];
-      for (const source of sources) {
-        for (const url of source.urls) {
-          if (this.signal.aborted || this.pending.get(key) !== token) return;
-          try {
-            const data = await this.download(url, this.signal);
-            if (!data) continue;
-            images.push({
-              name: source.name,
-              data,
-              ...(source.fileId ? { fileId: source.fileId } : {}),
-            });
-            break;
-          } catch {
-            // Deleted, inaccessible or offline images must not interrupt logging.
+    const run = () => {
+      this.running++;
+      void (async () => {
+        const images: SavedImage[] = [];
+        for (const source of sources) {
+          for (const url of source.urls) {
+            if (this.signal.aborted || this.pending.get(key) !== token) return;
+            try {
+              const data = await this.download(url, this.signal);
+              if (!data) continue;
+              images.push({
+                name: source.name,
+                data,
+                ...(source.fileId ? { fileId: source.fileId } : {}),
+              });
+              break;
+            } catch {
+              // Deleted, inaccessible or offline images must not interrupt logging.
+            }
           }
         }
-      }
-      if (
-        this.signal.aborted ||
-        this.pending.get(key) !== token ||
-        !images.length
-      )
-        return;
-      this.recent.set(key, images);
-      while (this.recent.size > MAX_RECENT)
-        this.recent.delete(this.recent.keys().next().value!);
-      if (this.retained.has(key)) this.retain(key);
-    })().finally(() => {
-      if (this.pending.get(key) === token) this.pending.delete(key);
-    });
+        if (
+          this.signal.aborted ||
+          this.pending.get(key) !== token ||
+          !images.length
+        )
+          return;
+        this.recent.set(key, images);
+        while (this.recent.size > MAX_RECENT)
+          this.recent.delete(this.recent.keys().next().value!);
+        if (this.retained.has(key)) this.retain(key);
+      })().finally(() => {
+        if (this.pending.get(key) === token) this.pending.delete(key);
+        this.running--;
+        if (this.signal.aborted) this.queued.clear();
+        const next = this.queued.entries().next().value;
+        if (next) {
+          this.queued.delete(next[0]);
+          next[1]();
+        }
+      });
+    };
+    if (this.running < 8) run();
+    else this.queued.set(key, run);
   }
 
   retain(key: string) {
@@ -1586,6 +2132,8 @@ class ImageArchive {
     this.retained.delete(key);
     this.recent.delete(key);
     this.attempted.delete(key);
+    this.pending.delete(key);
+    this.queued.delete(key);
     this.archived.delete(key);
     this.remove(key);
   }
@@ -1595,7 +2143,7 @@ class ImageArchive {
     while (this.archived.size > MAX_ARCHIVED) {
       const key = this.archived.keys().next().value!;
       this.archived.delete(key);
-      this.remove(key);
+      // Durable eviction belongs to the locked image index, not this cached view.
     }
   }
 

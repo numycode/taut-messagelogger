@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fixture, start, edit } from "./fixture.mjs";
-import { ScopedStorage, blobFixture } from "./taut-storage.mjs";
+import { ScopedStorage, blobFixture, readEntries } from "./taut-storage.mjs";
 test("actual Taut locked stores preserve concurrent plugin updates and broadcast dismissal", async (t) => {
   const blob = blobFixture();
   const a = fixture(),
@@ -37,7 +37,11 @@ test("actual Taut locked stores preserve concurrent plugin updates and broadcast
   await b.plugin.flush();
   await a.plugin.saved.refresh();
   assert.equal(a.plugin.entries.has("C:1"), false);
-  const disk = JSON.parse(await blob.read("workspace:TTEST:entries"));
-  assert.equal(Object.keys(disk).length, 1);
+  const disk = await readEntries(blob);
+  assert.equal(
+    Object.keys(disk).filter((key) => key !== "__dismissals").length,
+    1,
+  );
+  assert.equal(disk.__dismissals.clock, 1);
   assert.equal(disk["C:2"].edits[0].oldText, "old");
 });

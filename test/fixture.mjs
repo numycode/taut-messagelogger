@@ -2,6 +2,7 @@ const backendListeners = new WeakMap();
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
+import "./taut-storage.mjs";
 export function fixture(shared = new Map(), team = "TTEST") {
   const React = {
     createContext: () => ({ Provider: "provider" }),
@@ -28,6 +29,11 @@ export function fixture(shared = new Map(), team = "TTEST") {
     backendListeners.set(shared, subscribers);
   }
   const storage = {
+    async delete(key) {
+      shared.delete(key);
+      for (const cb of subscribers.get(key) ?? []) cb();
+      return true;
+    },
     store(key, fallback) {
       if (!shared.has(key)) shared.set(key, fallback);
       const listeners = subscribers.get(key) ?? new Set();
@@ -35,6 +41,10 @@ export function fixture(shared = new Map(), team = "TTEST") {
       return {
         get: () => shared.get(key),
         ready: Promise.resolve(),
+        async refresh() {
+          for (const cb of listeners) cb();
+          return shared.get(key) ?? fallback;
+        },
         subscribe: (f) => (listeners.add(f), () => listeners.delete(f)),
         async update(f) {
           shared.set(key, f(shared.get(key)));
@@ -92,6 +102,7 @@ export function fixture(shared = new Map(), team = "TTEST") {
       AbortSignal,
       URL,
       TextEncoder,
+      navigator,
       location: { pathname: "/client/" + team + "/channel" },
     },
   };
@@ -108,6 +119,7 @@ export async function start(f = fixture()) {
     saveImages: false,
   });
   f.plugin.start();
+  await f.plugin.saved?.ready;
   await Promise.resolve();
   await Promise.resolve();
   return f;

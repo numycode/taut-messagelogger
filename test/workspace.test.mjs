@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fixture, start, edit } from "./fixture.mjs";
 
+function storedEntries(shared, team) {
+  return Object.assign(
+    {},
+    ...[...shared]
+      .filter(([key]) => key.startsWith(`workspace:${team}:entries:v2:`))
+      .map(([, value]) => value),
+  );
+}
+
 // Offline lifecycle regressions load the built plugin, with no Slack/network calls.
 for (const id of ["T0AT86SDAM8", "E09V59WQY1E"]) {
   for (const source of ["redux", "url"]) {
@@ -29,10 +38,7 @@ for (const id of ["T0AT86SDAM8", "E09V59WQY1E"]) {
         previous_message: { ts: "1", user: "ME", text: "new" },
       });
       await f.plugin.flush();
-      assert.equal(
-        f.shared.get(`workspace:${id}:entries`)["C:1"].deleted,
-        true,
-      );
+      assert.equal(storedEntries(f.shared, id)["C:1"].deleted, true);
       assert.equal(f.shared.has("workspace:TOTHER:entries"), false);
       assert.equal(f.api.inject()[0].text, "new");
     });
@@ -81,11 +87,11 @@ test("Enterprise and team archives remain isolated and switching disables old ca
   assert.equal(a.plugin.entries.get("C:1").edits[0].oldText, "enterprise old");
   assert.equal(b.plugin.entries.get("C:1").edits[0].oldText, "team old");
   assert.equal(
-    shared.get("workspace:E09V59WQY1E:entries")["C:1"].edits[0].oldText,
+    storedEntries(shared, "E09V59WQY1E")["C:1"].edits[0].oldText,
     "enterprise old",
   );
   assert.equal(
-    shared.get("workspace:T0AT86SDAM8:entries")["C:1"].edits[0].oldText,
+    storedEntries(shared, "T0AT86SDAM8")["C:1"].edits[0].oldText,
     "team old",
   );
   a.api.redux.getRawState = () => ({ selfTeamIds: { teamId: "T0AT86SDAM8" } });

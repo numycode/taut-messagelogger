@@ -132,7 +132,7 @@ test("count, edit count, edit text and recent payload bounds hold under burst", 
   assert.equal(e.edits.length, 20);
   assert.equal(e.edits[0].oldText.length, 4000);
   assert.ok(f.plugin.recent.size <= 400);
-  assert.ok(f.stats().writes < 10);
+  assert.ok(f.stats().writes <= 70); // One bounded write per touched bucket, plus small index writes.
 });
 test("image sources reject private network, arbitrary hosts, ports, userinfo and preserve concurrency", async (t) => {
   const f = await start();
@@ -165,7 +165,9 @@ test("image sources reject private network, arbitrary hosts, ports, userinfo and
     f.events.get("*")(msg);
   }
   assert.equal(calls, 8);
-  assert.equal(f.plugin.images.pending.size, 8);
+  assert.equal(f.plugin.images.running, 8);
+  assert.equal(f.plugin.images.queued.size, 8);
+  assert.equal(f.plugin.images.pending.size, 16);
   f.controller.abort();
   release();
   await new Promise((r) => setTimeout(r, 0));
@@ -302,6 +304,8 @@ test("cross-tab archived preview synchronization and image persistence batching"
     await a.plugin.stop();
     await b.plugin.stop();
   });
+  await Promise.all([a.plugin.imageSaved.ready, b.plugin.imageSaved.ready]);
+  const before = a.stats().writes;
   a.plugin.config.saveImages = true;
   a.plugin.images.download = async () => "data:image/png;base64,aGVsbG8=";
   for (let i = 0; i < 8; i++)
@@ -322,8 +326,10 @@ test("cross-tab archived preview synchronization and image persistence batching"
     });
   await a.plugin.flush();
   await a.plugin.flushImages();
-  assert.equal(b.plugin.images.get("C:0").length, 1);
-  assert.ok(a.stats().writes <= 4);
+  for (let i = 0; i < 8; i++)
+    assert.equal(b.plugin.images.get("C:" + i).length, 1);
+  // Eight buckets in each archive, plus pending/complete index writes per archive.
+  assert.equal(a.stats().writes - before, 20);
 });
 test("UTF-8 message bound and long edit replay deduplication", async (t) => {
   const f = await start();
@@ -472,7 +478,10 @@ test("accepting deletion in another tab prevents an in-flight preview from resur
   await new Promise((r) => setTimeout(r, 0));
   await a.plugin.flushImages();
   assert.equal(a.plugin.images.get("C:1").length, 0);
-  assert.equal(shared.get("workspace:TTEST:images")["C:1"], undefined);
+  assert.equal(shared.get("workspace:TTEST:image-index:v2").schema, 2);
+  for (const [key, values] of shared)
+    if (key.startsWith("workspace:TTEST:images:v2:"))
+      assert.equal(values["C:1"], undefined);
 });
 test("oversized identity fields cannot bypass message payload bound", async (t) => {
   const f = await start();
